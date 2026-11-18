@@ -1408,8 +1408,8 @@ func updateActiveHostsForIngresses(hosts map[string]Resource, resources map[stri
 		}
 
 		for _, rule := range ingConfig.Ingress.Spec.Rules {
-			res := hosts[rule.Host]
-			ingConfig.ValidHosts[rule.Host] = res.GetKeyWithKind() == r.GetKeyWithKind()
+			res := activeHostResource(hosts, rule.Host, r)
+			ingConfig.ValidHosts[rule.Host] = res != nil
 		}
 	}
 }
@@ -1491,9 +1491,9 @@ func (c *Configuration) addProblemsForResourcesWithoutActiveHost(resources map[s
 				problems[r.GetKeyWithKind()] = p
 			}
 		case *VirtualServerConfiguration:
-			res := c.hosts[impl.VirtualServer.Spec.Host]
+			res := activeHostResource(c.hosts, impl.VirtualServer.Spec.Host, r)
 
-			if res.GetKeyWithKind() != r.GetKeyWithKind() {
+			if res == nil {
 				p := ConfigurationProblem{
 					Object:  impl.VirtualServer,
 					IsError: false,
@@ -1503,9 +1503,9 @@ func (c *Configuration) addProblemsForResourcesWithoutActiveHost(resources map[s
 				problems[r.GetKeyWithKind()] = p
 			}
 		case *TransportServerConfiguration:
-			res := c.hosts[impl.TransportServer.Spec.Host]
+			res := activeHostResource(c.hosts, impl.TransportServer.Spec.Host, r)
 
-			if res.GetKeyWithKind() != r.GetKeyWithKind() {
+			if res == nil {
 				p := ConfigurationProblem{
 					Object:  impl.TransportServer,
 					IsError: false,
@@ -1528,23 +1528,27 @@ func (c *Configuration) addWarningsForVirtualServersWithMissConfiguredListeners(
 			continue
 		}
 		if vsc.VirtualServer.Spec.Listener != nil {
+			target := activeHostResource(c.hosts, vsc.VirtualServer.Spec.Host, vsc)
+			if target == nil {
+				target = c.hosts[vsc.VirtualServer.Spec.Host]
+			}
 			if c.globalConfiguration == nil {
 				warningMsg := "Listeners defined, but no GlobalConfiguration is deployed"
-				c.hosts[vsc.VirtualServer.Spec.Host].AddWarning(warningMsg)
+				target.AddWarning(warningMsg)
 				continue
 			}
 
 			if !c.isListenerInCorrectBlock(vsc.VirtualServer.Spec.Listener.HTTP, false) {
 				warningMsg := fmt.Sprintf("Listener %s can't be use in `listener.http` context as SSL is enabled for that listener.",
 					vsc.VirtualServer.Spec.Listener.HTTP)
-				c.hosts[vsc.VirtualServer.Spec.Host].AddWarning(warningMsg)
+				target.AddWarning(warningMsg)
 				continue
 			}
 
 			if !c.isListenerInCorrectBlock(vsc.VirtualServer.Spec.Listener.HTTPS, true) {
 				warningMsg := fmt.Sprintf("Listener %s can't be use in `listener.https` context as SSL is not enabled for that listener.",
 					vsc.VirtualServer.Spec.Listener.HTTPS)
-				c.hosts[vsc.VirtualServer.Spec.Host].AddWarning(warningMsg)
+				target.AddWarning(warningMsg)
 				continue
 			}
 
@@ -1552,7 +1556,7 @@ func (c *Configuration) addWarningsForVirtualServersWithMissConfiguredListeners(
 				if _, exists := c.listenerMap[vsc.VirtualServer.Spec.Listener.HTTP]; !exists {
 					warningMsg := fmt.Sprintf("Listener %s is not defined in GlobalConfiguration",
 						vsc.VirtualServer.Spec.Listener.HTTP)
-					c.hosts[vsc.VirtualServer.Spec.Host].AddWarning(warningMsg)
+					target.AddWarning(warningMsg)
 					continue
 				}
 			}
@@ -1561,7 +1565,7 @@ func (c *Configuration) addWarningsForVirtualServersWithMissConfiguredListeners(
 				if _, exists := c.listenerMap[vsc.VirtualServer.Spec.Listener.HTTPS]; !exists {
 					warningMsg := fmt.Sprintf("Listener %s is not defined in GlobalConfiguration",
 						vsc.VirtualServer.Spec.Listener.HTTPS)
-					c.hosts[vsc.VirtualServer.Spec.Host].AddWarning(warningMsg)
+					target.AddWarning(warningMsg)
 					continue
 				}
 			}
@@ -1579,9 +1583,13 @@ func (c *Configuration) isListenerInCorrectBlock(listenerName string, expectedSs
 func (c *Configuration) addProblemsForOrphanMinions(problems map[string]ConfigurationProblem) {
 	// Iterate only over indexed minions instead of all ingresses.
 	for host, minionKeys := range c.minionsByHost {
-		r, exists := c.hosts[host]
-		ingressConf, ok := r.(*IngressConfiguration)
-		hasMaster := exists && ok && ingressConf.IsMaster
+		hasMaster := false
+		for _, r := range c.hosts {
+			if ing, ok := r.(*IngressConfiguration); ok && ing.IsMaster && ing.Ingress.Spec.Rules[0].Host == host {
+				hasMaster = true
+				break
+			}
+		}
 
 		if hasMaster {
 			continue
@@ -1626,11 +1634,8 @@ func (c *Configuration) addProblemsForOrphanOrIgnoredVsrs(problems map[string]Co
 		k := getResourceKeyWithKind(virtualServerRouteKind, &vsr.ObjectMeta)
 
 		if vsr.Spec.Host != "" {
-			// Host-based VSR: use the host owner to report when its VirtualServer ignores the route.
-			r, exists := c.hosts[vsr.Spec.Host]
-			vsConfig, ok := r.(*VirtualServerConfiguration)
-
-			if !exists || !ok {
+			vsConfig := c.activeVirtualServerForRoute(vsr)
+			if vsConfig == nil {
 				problems[k] = ConfigurationProblem{
 					Object:  vsr,
 					IsError: false,
@@ -1857,6 +1862,7 @@ func (c *Configuration) buildHostsAndResources() (newHosts map[string]Resource, 
 	newResources = make(map[string]Resource)
 	vsrToVSConfigs = make(map[string][]*conf_v1.VirtualServer)
 	var challengesVSR []*conf_v1.VirtualServerRoute
+	var claims []hostClaim
 
 	// Step 1 - Build hosts from Ingress resources
 
@@ -1887,20 +1893,7 @@ func (c *Configuration) buildHostsAndResources() (newHosts map[string]Resource, 
 		newResources[resource.GetKeyWithKind()] = resource
 
 		for _, rule := range ing.Spec.Rules {
-			holder, exists := newHosts[rule.Host]
-			if !exists {
-				newHosts[rule.Host] = resource
-				continue
-			}
-
-			warning := fmt.Sprintf("host %s is taken by another resource", rule.Host)
-
-			if !holder.Wins(resource) {
-				holder.AddWarning(warning)
-				newHosts[rule.Host] = resource
-			} else {
-				resource.AddWarning(warning)
-			}
+			claims = append(claims, c.newHostClaim(rule.Host, resource))
 		}
 	}
 
@@ -1923,26 +1916,7 @@ func (c *Configuration) buildHostsAndResources() (newHosts map[string]Resource, 
 
 		newResources[resource.GetKeyWithKind()] = resource
 
-		// Index accepted VirtualServers by VSR key in sorted VS order.
-		for _, vsr := range resource.VirtualServerRoutes {
-			vsrKey := getResourceKey(&vsr.ObjectMeta)
-			vsrToVSConfigs[vsrKey] = append(vsrToVSConfigs[vsrKey], vs)
-		}
-
-		holder, exists := newHosts[vs.Spec.Host]
-		if !exists {
-			newHosts[vs.Spec.Host] = resource
-			continue
-		}
-
-		warning := fmt.Sprintf("host %s is taken by another resource", vs.Spec.Host)
-
-		if !holder.Wins(resource) {
-			newHosts[vs.Spec.Host] = resource
-			holder.AddWarning(warning)
-		} else {
-			resource.AddWarning(warning)
-		}
+		claims = append(claims, c.newHostClaim(vs.Spec.Host, resource))
 	}
 
 	// Step - 3 - Build hosts from TransportServer resources if TLS Passthrough is enabled
@@ -1958,23 +1932,22 @@ func (c *Configuration) buildHostsAndResources() (newHosts map[string]Resource, 
 			resource := NewTransportServerConfiguration(ts)
 			newResources[resource.GetKeyWithKind()] = resource
 
-			holder, exists := newHosts[ts.Spec.Host]
-			if !exists {
-				newHosts[ts.Spec.Host] = resource
-				continue
-			}
-
-			warning := fmt.Sprintf("host %s is taken by another resource", ts.Spec.Host)
-
-			if !holder.Wins(resource) {
-				newHosts[ts.Spec.Host] = resource
-				holder.AddWarning(warning)
-			} else {
-				resource.AddWarning(warning)
-			}
+			claims = append(claims, c.newHostClaim(ts.Spec.Host, resource))
 		}
 	}
 
+	newHosts = c.selectHostClaims(claims)
+	// Preserve declarative VSR references even when a parent loses a host claim.
+	for _, key := range getSortedResourceKeys(newResources) {
+		vsc, ok := newResources[key].(*VirtualServerConfiguration)
+		if !ok {
+			continue
+		}
+		for _, vsr := range vsc.VirtualServerRoutes {
+			vsrKey := getResourceKey(&vsr.ObjectMeta)
+			vsrToVSConfigs[vsrKey] = append(vsrToVSConfigs[vsrKey], vsc.VirtualServer)
+		}
+	}
 	return newHosts, newResources, vsrToVSConfigs
 }
 
