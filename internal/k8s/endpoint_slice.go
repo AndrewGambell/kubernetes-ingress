@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"reflect"
 
+	v1 "k8s.io/api/core/v1"
 	discovery_v1 "k8s.io/api/discovery/v1"
 	"k8s.io/client-go/tools/cache"
 
@@ -82,6 +83,21 @@ func (lbc *LoadBalancerController) syncEndpointSlices(task task) {
 	if err != nil {
 		lbc.syncQueue.Requeue(task, err)
 		return
+	}
+
+	if lbc.statusUpdater != nil && ns == lbc.statusUpdater.namespace {
+		if !endpointSliceExists {
+			lbc.refreshCustomListenerEndpoints()
+		} else {
+			slice := obj.(*discovery_v1.EndpointSlice)
+			svcName := slice.Labels["kubernetes.io/service-name"]
+			if nsi.svcLister != nil {
+				svc, found, _ := nsi.svcLister.GetByKey(ns + "/" + svcName)
+				if found && (svcName == lbc.statusUpdater.externalServiceName || svc.(*v1.Service).Annotations[listenerServiceAnnotation] != "") {
+					lbc.refreshCustomListenerEndpoints()
+				}
+			}
+		}
 	}
 
 	if !endpointSliceExists {

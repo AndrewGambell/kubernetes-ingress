@@ -14,6 +14,14 @@ server. In this example, we deploy an ExternalDNS deployment with the AWS provid
    docs](https://docs.nginx.com/nginx-ingress-controller/configuration/global-configuration/reporting-resources-status#virtualserver-and-virtualserverroute-resources)
    for more details).
 
+### Publishing a shared hostname
+
+When VirtualServers share a hostname across custom listeners, configure one DNS
+publisher per hostname and record type in each zone. Include Ingress resources in
+that check if ExternalDNS also watches Ingress. To return several VIPs for one
+hostname, publish them together and ensure each VIP serves the hostname on the
+port clients use.
+
 ### Selecting the DNSEndpoint API group
 
 NGINX Ingress Controller can write `DNSEndpoint` resources to one of two API groups:

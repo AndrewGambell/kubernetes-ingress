@@ -559,6 +559,8 @@ func NewLoadBalancerController(input NewLoadBalancerControllerInput) *LoadBalanc
 		input.AllowEmptyIngressHost,
 	)
 
+	lbc.statusUpdater.configuration = lbc.configuration
+
 	lbc.appProtectConfiguration = appprotect.NewConfiguration(lbc.Logger)
 	lbc.dosConfiguration = appprotectdos.NewConfiguration(input.AppProtectDosEnabled)
 

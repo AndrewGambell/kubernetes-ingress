@@ -124,6 +124,28 @@ that was deployed in Step 1. Below is the yaml of this example VirtualServer:
     kubectl create -f cafe-virtual-server.yaml
     ```
 
+### Report external endpoints for custom listeners
+
+On each Service that exposes a custom listener, add the `nginx.org/listeners` annotation.
+Use a comma-separated list for a Service that exposes several listeners.
+
+```yaml
+metadata:
+  annotations:
+    nginx.org/listeners: "https-8443"
+```
+
+You can annotate several Services with the same listener name. Create those Services
+in the controller namespace and configure their TCP `targetPort` to reach the listener.
+The VirtualServer reports the matching Services' external addresses and client-facing
+ports in `status.externalEndpoints`. Named target ports are resolved from EndpointSlices.
+
+For a listener with no annotated Services, the controller can use the unannotated
+`-external-service` if it exposes the listener port. The `external-status-address`
+ConfigMap setting takes precedence.
+
+If you share a hostname across listeners, follow the [ExternalDNS publishing guidance](../external-dns/#publishing-a-shared-hostname).
+
 ## Step 4 - Test the Configuration
 
 1. Check that the configuration has been successfully applied by inspecting the events of the VirtualServer:

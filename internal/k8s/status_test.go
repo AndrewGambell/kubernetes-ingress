@@ -806,7 +806,7 @@ func TestHasVsStatusChanged(t *testing.T) {
 	for _, test := range tests {
 		test := test // address gosec G601
 		t.Run(test.desc, func(t *testing.T) {
-			changed := su.hasVsStatusChanged(&test.vs, state, reason, msg)
+			changed := su.hasVsStatusChanged(&test.vs, state, reason, msg, su.externalEndpoints)
 
 			if changed != test.expected {
 				t.Errorf("hasVsStatusChanged(%v, %v, %v, %v) returned %v but expected %v for test: %s", test.vs, state, reason, msg, changed, test.expected, test.desc)
@@ -963,7 +963,7 @@ func TestHasVsrStatusChanged(t *testing.T) {
 	for _, test := range tests {
 		test := test // address gosec G601
 		t.Run(test.desc, func(t *testing.T) {
-			changed := su.hasVsrStatusChanged(&test.vsr, state, reason, msg, &referencedBy)
+			changed := su.hasVsrStatusChanged(&test.vsr, state, reason, msg, &referencedBy, su.externalEndpoints)
 
 			if changed != test.expected {
 				t.Errorf("hasVsrStatusChanged(%v, %v, %v, %v) returned %v but expected %v for test: %s", test.vsr, state, reason, msg, changed, test.expected, test.desc)
@@ -991,17 +991,17 @@ func TestHasVsrStatusChangedReferencedByPointerSemantics(t *testing.T) {
 		},
 	}
 
-	if changed := su.hasVsrStatusChanged(vsr, state, reason, msg, nil); changed {
+	if changed := su.hasVsrStatusChanged(vsr, state, reason, msg, nil, su.externalEndpoints); changed {
 		t.Errorf("hasVsrStatusChanged with nil referencedBy = true, want false (field must be ignored)")
 	}
 
 	empty := ""
-	if changed := su.hasVsrStatusChanged(vsr, state, reason, msg, &empty); !changed {
+	if changed := su.hasVsrStatusChanged(vsr, state, reason, msg, &empty, su.externalEndpoints); !changed {
 		t.Errorf("hasVsrStatusChanged with &\"\" referencedBy against a non-empty stored value = false, want true (must detect the shrink-to-empty case)")
 	}
 
 	same := "default/vs-a, default/vs-b"
-	if changed := su.hasVsrStatusChanged(vsr, state, reason, msg, &same); changed {
+	if changed := su.hasVsrStatusChanged(vsr, state, reason, msg, &same, su.externalEndpoints); changed {
 		t.Errorf("hasVsrStatusChanged with an unchanged referencedBy pointer = true, want false")
 	}
 }

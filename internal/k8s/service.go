@@ -49,11 +49,13 @@ func createServiceHandlers(lbc *LoadBalancerController) cache.ResourceEventHandl
 		UpdateFunc: func(old, cur interface{}) {
 			if !reflect.DeepEqual(old, cur) {
 				curSvc := cur.(*v1.Service)
-				if lbc.IsExternalServiceForStatus(curSvc) {
+				oldSvc := old.(*v1.Service)
+				if lbc.IsExternalServiceForStatus(curSvc) ||
+					(lbc.statusUpdater.namespace == curSvc.Namespace &&
+						(oldSvc.Annotations[listenerServiceAnnotation] != "" || curSvc.Annotations[listenerServiceAnnotation] != "")) {
 					lbc.AddSyncQueue(curSvc)
 					return
 				}
-				oldSvc := old.(*v1.Service)
 				if hasServicedChanged(oldSvc, curSvc) {
 					nl.Infof(lbc.Logger.With(logNamespaceKey, oldSvc.Namespace, logKindKey, serviceKind, logNameKey, oldSvc.Name), "Service %v changed, syncing", curSvc.Name)
 					lbc.AddSyncQueue(curSvc)
@@ -257,6 +259,10 @@ func (lbc *LoadBalancerController) syncService(task task) {
 		}
 
 		// we don't return here because technically the same service could be used in the second case
+	}
+
+	if ns == lbc.statusUpdater.namespace && !lbc.IsExternalServiceKeyForStatus(key) {
+		lbc.refreshCustomListenerEndpoints()
 	}
 
 	// Second case: the service is referenced by some resources in the cluster
