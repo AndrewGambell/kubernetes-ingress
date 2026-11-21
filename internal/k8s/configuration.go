@@ -1491,16 +1491,22 @@ func (c *Configuration) addProblemsForResourcesWithoutActiveHost(resources map[s
 				problems[r.GetKeyWithKind()] = p
 			}
 		case *VirtualServerConfiguration:
-			res := c.hosts[impl.VirtualServer.Spec.Host]
+			hostKey := hostListenerKey(impl.VirtualServer.Spec.Host, impl.VirtualServer.Spec.Listener)
+			res := c.hosts[hostKey]
 
-			if res.GetKeyWithKind() != r.GetKeyWithKind() {
-				p := ConfigurationProblem{
+			if res == nil || res.GetKeyWithKind() != r.GetKeyWithKind() {
+				// The host conflict is the last warning added to a VS rejected in buildHostsAndResources;
+				// earlier warnings may be unrelated (e.g. invalid VirtualServerRoutes).
+				msg := "Host is taken by another resource"
+				if n := len(impl.Warnings); n > 0 {
+					msg = impl.Warnings[n-1]
+				}
+				problems[r.GetKeyWithKind()] = ConfigurationProblem{
 					Object:  impl.VirtualServer,
 					IsError: false,
 					Reason:  nl.EventReasonRejected,
-					Message: "Host is taken by another resource",
+					Message: msg,
 				}
-				problems[r.GetKeyWithKind()] = p
 			}
 		case *TransportServerConfiguration:
 			res := c.hosts[impl.TransportServer.Spec.Host]
@@ -1528,23 +1534,30 @@ func (c *Configuration) addWarningsForVirtualServersWithMissConfiguredListeners(
 			continue
 		}
 		if vsc.VirtualServer.Spec.Listener != nil {
+			hostKey := hostListenerKey(vsc.VirtualServer.Spec.Host, vsc.VirtualServer.Spec.Listener)
+			vsResource := c.hosts[hostKey]
+
+			if vsResource == nil || vsResource.GetKeyWithKind() != vsc.GetKeyWithKind() {
+				continue
+			}
+
 			if c.globalConfiguration == nil {
 				warningMsg := "Listeners defined, but no GlobalConfiguration is deployed"
-				c.hosts[vsc.VirtualServer.Spec.Host].AddWarning(warningMsg)
+				vsResource.AddWarning(warningMsg)
 				continue
 			}
 
 			if !c.isListenerInCorrectBlock(vsc.VirtualServer.Spec.Listener.HTTP, false) {
 				warningMsg := fmt.Sprintf("Listener %s can't be use in `listener.http` context as SSL is enabled for that listener.",
 					vsc.VirtualServer.Spec.Listener.HTTP)
-				c.hosts[vsc.VirtualServer.Spec.Host].AddWarning(warningMsg)
+				vsResource.AddWarning(warningMsg)
 				continue
 			}
 
 			if !c.isListenerInCorrectBlock(vsc.VirtualServer.Spec.Listener.HTTPS, true) {
 				warningMsg := fmt.Sprintf("Listener %s can't be use in `listener.https` context as SSL is not enabled for that listener.",
 					vsc.VirtualServer.Spec.Listener.HTTPS)
-				c.hosts[vsc.VirtualServer.Spec.Host].AddWarning(warningMsg)
+				vsResource.AddWarning(warningMsg)
 				continue
 			}
 
@@ -1552,7 +1565,7 @@ func (c *Configuration) addWarningsForVirtualServersWithMissConfiguredListeners(
 				if _, exists := c.listenerMap[vsc.VirtualServer.Spec.Listener.HTTP]; !exists {
 					warningMsg := fmt.Sprintf("Listener %s is not defined in GlobalConfiguration",
 						vsc.VirtualServer.Spec.Listener.HTTP)
-					c.hosts[vsc.VirtualServer.Spec.Host].AddWarning(warningMsg)
+					vsResource.AddWarning(warningMsg)
 					continue
 				}
 			}
@@ -1561,7 +1574,7 @@ func (c *Configuration) addWarningsForVirtualServersWithMissConfiguredListeners(
 				if _, exists := c.listenerMap[vsc.VirtualServer.Spec.Listener.HTTPS]; !exists {
 					warningMsg := fmt.Sprintf("Listener %s is not defined in GlobalConfiguration",
 						vsc.VirtualServer.Spec.Listener.HTTPS)
-					c.hosts[vsc.VirtualServer.Spec.Host].AddWarning(warningMsg)
+					vsResource.AddWarning(warningMsg)
 					continue
 				}
 			}
@@ -1620,17 +1633,28 @@ func (c *Configuration) GetVirtualServerRoutesWithChangedReferences() []*conf_v1
 
 // addProblemsForOrphanOrIgnoredVsrs emits orphan and ignored-route problems for VSRs.
 func (c *Configuration) addProblemsForOrphanOrIgnoredVsrs(problems map[string]ConfigurationProblem) {
+	// Multiple VirtualServers may share a host on different listeners. Index the first active VS per host
+	// in sorted host-key order, so the default-listener VS (keyed by the bare hostname) is preferred.
+	activeVSByHost := make(map[string]*VirtualServerConfiguration)
+	for _, hostKey := range getSortedResourceKeys(c.hosts) {
+		vsc, ok := c.hosts[hostKey].(*VirtualServerConfiguration)
+		if !ok {
+			continue
+		}
+		if _, exists := activeVSByHost[vsc.VirtualServer.Spec.Host]; !exists {
+			activeVSByHost[vsc.VirtualServer.Spec.Host] = vsc
+		}
+	}
+
 	for _, key := range getSortedVirtualServerRouteKeys(c.virtualServerRoutes) {
 		vsr := c.virtualServerRoutes[key]
 		vsrKey := getResourceKey(&vsr.ObjectMeta)
 		k := getResourceKeyWithKind(virtualServerRouteKind, &vsr.ObjectMeta)
 
 		if vsr.Spec.Host != "" {
-			// Host-based VSR: use the host owner to report when its VirtualServer ignores the route.
-			r, exists := c.hosts[vsr.Spec.Host]
-			vsConfig, ok := r.(*VirtualServerConfiguration)
-
-			if !exists || !ok {
+			// Host-based VSR: it is owned if any active VirtualServer on its host accepts it.
+			vsConfig, exists := activeVSByHost[vsr.Spec.Host]
+			if !exists {
 				problems[k] = ConfigurationProblem{
 					Object:  vsr,
 					IsError: false,
@@ -1641,8 +1665,12 @@ func (c *Configuration) addProblemsForOrphanOrIgnoredVsrs(problems map[string]Co
 			}
 
 			found := false
-			for _, v := range vsConfig.VirtualServerRoutes {
-				if vsr.Namespace == v.Namespace && vsr.Name == v.Name {
+			for _, vs := range c.vsrToVSConfigs[vsrKey] {
+				if vs.Spec.Host != vsr.Spec.Host {
+					continue
+				}
+				r, ok := c.hosts[hostListenerKey(vs.Spec.Host, vs.Spec.Listener)]
+				if ok && r.GetKeyWithKind() == getResourceKeyWithKind(virtualServerKind, &vs.ObjectMeta) {
 					found = true
 					break
 				}
@@ -1906,6 +1934,8 @@ func (c *Configuration) buildHostsAndResources() (newHosts map[string]Resource, 
 
 	// Step 2 - Build hosts from VirtualServer resources
 
+	var vsConfigs []*VirtualServerConfiguration
+
 	for _, key := range getSortedVirtualServerKeys(c.virtualServers) {
 		vs := c.virtualServers[key]
 
@@ -1929,19 +1959,61 @@ func (c *Configuration) buildHostsAndResources() (newHosts map[string]Resource, 
 			vsrToVSConfigs[vsrKey] = append(vsrToVSConfigs[vsrKey], vs)
 		}
 
-		holder, exists := newHosts[vs.Spec.Host]
-		if !exists {
-			newHosts[vs.Spec.Host] = resource
-			continue
+		vsConfigs = append(vsConfigs, resource)
+	}
+
+	// Resolve host and listener conflicts in winner order (oldest first), so a newer VirtualServer
+	// never displaces an existing one regardless of its name.
+	sort.SliceStable(vsConfigs, func(i, j int) bool {
+		return vsConfigs[i].Wins(vsConfigs[j])
+	})
+
+	// Accepted VirtualServers per hostname, used to detect listener overlaps.
+	vsConfigsByHost := make(map[string][]*VirtualServerConfiguration)
+
+	for _, resource := range vsConfigs {
+		vs := resource.VirtualServer
+		hostKey := hostListenerKey(vs.Spec.Host, vs.Spec.Listener)
+
+		hasConflict := false
+		if holder, exists := newHosts[vs.Spec.Host]; exists {
+			if _, ok := holder.(*VirtualServerConfiguration); !ok {
+				// A VS on the default listener competes with the holder of the bare hostname (e.g. an Ingress);
+				// a VS on a custom listener never displaces it.
+				warning := fmt.Sprintf("host %s is taken by another resource", vs.Spec.Host)
+				if vs.Spec.Listener == nil && !holder.Wins(resource) {
+					holder.AddWarning(warning)
+				} else {
+					hasConflict = true
+					resource.AddWarning(warning)
+				}
+			}
 		}
 
-		warning := fmt.Sprintf("host %s is taken by another resource", vs.Spec.Host)
+		if !hasConflict {
+			for _, existingVS := range vsConfigsByHost[vs.Spec.Host] {
+				if hasListenerOverlap(vs.Spec.Listener, existingVS.VirtualServer.Spec.Listener) {
+					hasConflict = true
+					resource.AddWarning(fmt.Sprintf("host %s with listeners (http:%s, https:%s) conflicts with VirtualServer %s/%s",
+						vs.Spec.Host,
+						listenerName(vs.Spec.Listener, false),
+						listenerName(vs.Spec.Listener, true),
+						existingVS.VirtualServer.Namespace,
+						existingVS.VirtualServer.Name))
+					existingVS.AddWarning(fmt.Sprintf("host %s with listeners (http:%s, https:%s) conflicts with VirtualServer %s/%s",
+						existingVS.VirtualServer.Spec.Host,
+						listenerName(existingVS.VirtualServer.Spec.Listener, false),
+						listenerName(existingVS.VirtualServer.Spec.Listener, true),
+						vs.Namespace,
+						vs.Name))
+					break
+				}
+			}
+		}
 
-		if !holder.Wins(resource) {
-			newHosts[vs.Spec.Host] = resource
-			holder.AddWarning(warning)
-		} else {
-			resource.AddWarning(warning)
+		if !hasConflict {
+			newHosts[hostKey] = resource
+			vsConfigsByHost[vs.Spec.Host] = append(vsConfigsByHost[vs.Spec.Host], resource)
 		}
 	}
 
@@ -1971,6 +2043,20 @@ func (c *Configuration) buildHostsAndResources() (newHosts map[string]Resource, 
 				holder.AddWarning(warning)
 			} else {
 				resource.AddWarning(warning)
+			}
+		}
+
+		// As with an Ingress, a VS on a custom listener never displaces a TransportServer holding the bare hostname.
+		for host, hostVSConfigs := range vsConfigsByHost {
+			if _, ok := newHosts[host].(*TransportServerConfiguration); !ok {
+				continue
+			}
+			for _, vsc := range hostVSConfigs {
+				if vsc.VirtualServer.Spec.Listener == nil {
+					continue
+				}
+				delete(newHosts, hostListenerKey(host, vsc.VirtualServer.Spec.Listener))
+				vsc.AddWarning(fmt.Sprintf("host %s is taken by another resource", host))
 			}
 		}
 	}
@@ -2694,4 +2780,48 @@ func (c *Configuration) balanceUpstreamProxies(upstreams []conf_v1.Upstream) {
 	for i := range upstreams {
 		internalValidation.BalanceProxiesForUpstreams(&upstreams[i], c.isDirectiveAutoadjustEnabled)
 	}
+}
+
+// hostListenerKey returns a map key encoding hostname and listener; nil listener uses the hostname alone.
+func hostListenerKey(host string, listener *conf_v1.VirtualServerListener) string {
+	if listener == nil {
+		return host
+	}
+	return fmt.Sprintf("%s|http:%s|https:%s", host, listener.HTTP, listener.HTTPS)
+}
+
+// hasListenerOverlap reports whether two listener configurations share any HTTP or HTTPS listener name.
+// A nil listener (default port) overlaps with everything.
+func hasListenerOverlap(l1, l2 *conf_v1.VirtualServerListener) bool {
+	if (l1 == nil) != (l2 == nil) {
+		return true
+	}
+	if l1 == nil {
+		return true
+	}
+	if l1.HTTP != "" && l2.HTTP != "" && l1.HTTP == l2.HTTP {
+		return true
+	}
+	if l1.HTTPS != "" && l2.HTTPS != "" && l1.HTTPS == l2.HTTPS {
+		return true
+	}
+	return false
+}
+
+// listenerName returns the HTTP (https=false) or HTTPS (https=true) listener name for display,
+// using "default" when listener is nil and "none" when the field is empty.
+func listenerName(listener *conf_v1.VirtualServerListener, https bool) string {
+	if listener == nil {
+		return "default"
+	}
+	if !https {
+		if listener.HTTP == "" {
+			return "none"
+		}
+		return listener.HTTP
+	}
+	if listener.HTTPS == "" {
+		return "none"
+	}
+	return listener.HTTPS
 }

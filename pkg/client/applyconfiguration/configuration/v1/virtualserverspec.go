@@ -9,7 +9,7 @@ package v1
 type VirtualServerSpecApplyConfiguration struct {
 	// Specifies which Ingress Controller must handle the VirtualServerRoute resource. Must be the same as the ingressClassName of the VirtualServer that references this resource.
 	IngressClass *string `json:"ingressClassName,omitempty"`
-	// The host (domain name) of the server. Must be a valid subdomain as defined in RFC 1123, such as my-app or hello.example.com. When using a wildcard domain like *.example.com the domain must be contained in double quotes. The host value needs to be unique among all Ingress and VirtualServer resources.
+	// The host (domain name) of the server. Must be a valid subdomain as defined in RFC 1123, such as my-app or hello.example.com. When using a wildcard domain like *.example.com the domain must be contained in double quotes. The host value needs to be unique among all Ingress and VirtualServer resources, unless it is shared only by VirtualServers whose custom listeners (listener.http and listener.https) do not overlap.
 	Host *string `json:"host,omitempty"`
 	// Sets a custom HTTP and/or HTTPS listener. Valid fields are listener.http and listener.https. Each field must reference the name of a valid listener defined in a GlobalConfiguration resource
 	Listener *VirtualServerListenerApplyConfiguration `json:"listener,omitempty"`

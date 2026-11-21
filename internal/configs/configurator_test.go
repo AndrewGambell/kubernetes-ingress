@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/prometheus/client_golang/prometheus"
@@ -1418,6 +1419,7 @@ func TestUpdateVirtualServerMetricsLabels(t *testing.T) {
 	}
 
 	// add labels for a new VirtualServer resource
+	cnf.virtualServers[getFileNameForVirtualServer(vsEx.VirtualServer)] = vsEx
 	cnf.updateVirtualServerMetricsLabels(vsEx, upstreams)
 	if !reflect.DeepEqual(cnf.labelUpdater, expectedLabelUpdater) {
 		t.Errorf("updateVirtualServerMetricsLabels() updated labels to \n%+v but expected \n%+v", cnf.labelUpdater, expectedLabelUpdater)
@@ -1496,6 +1498,7 @@ func TestUpdateVirtualServerMetricsLabels(t *testing.T) {
 	}
 
 	// delete labels for a deleted VirtualServer
+	delete(cnf.virtualServers, getFileNameForVirtualServer(vsEx.VirtualServer))
 	cnf.deleteVirtualServerMetricsLabels("default/test-vs")
 	if !reflect.DeepEqual(cnf.labelUpdater, expectedLabelUpdater) {
 		t.Errorf("deleteVirtualServerMetricsLabels() updated labels to \n%+v but expected \n%+v", cnf.labelUpdater, expectedLabelUpdater)
@@ -1503,6 +1506,88 @@ func TestUpdateVirtualServerMetricsLabels(t *testing.T) {
 
 	if !reflect.DeepEqual(testLatencyCollector, expectedLatencyCollector) {
 		t.Errorf("updateVirtualServerMetricsLabels() updated latency collector's labels to \n%+v but expected \n%+v", testLatencyCollector, expectedLatencyCollector)
+	}
+}
+
+func TestUpdateVirtualServerMetricsLabelsForVirtualServersSharingHost(t *testing.T) {
+	t.Parallel()
+	cnf := createTestConfigurator(t)
+
+	cnf.isPlus = true
+	labelUpdater := newFakeLabelUpdater()
+	cnf.labelUpdater = labelUpdater
+	cnf.latencyCollector = newMockLatencyCollector()
+
+	// As in addOrUpdateVirtualServer and DeleteVirtualServer, cnf.virtualServers is updated before the labels.
+	addOrUpdate := func(vsEx *VirtualServerEx) {
+		cnf.virtualServers[getFileNameForVirtualServer(vsEx.VirtualServer)] = vsEx
+		cnf.updateVirtualServerMetricsLabels(vsEx, nil)
+	}
+	deleteVS := func(vsEx *VirtualServerEx) {
+		delete(cnf.virtualServers, getFileNameForVirtualServer(vsEx.VirtualServer))
+		cnf.deleteVirtualServerMetricsLabels(generateNamespaceNameKey(&vsEx.VirtualServer.ObjectMeta))
+	}
+	newVSEx := func(name string, created time.Time, listener *conf_v1.VirtualServerListener) *VirtualServerEx {
+		return &VirtualServerEx{
+			VirtualServer: &conf_v1.VirtualServer{
+				ObjectMeta: meta_v1.ObjectMeta{
+					Name:              name,
+					Namespace:         "default",
+					CreationTimestamp: meta_v1.NewTime(created),
+				},
+				Spec: conf_v1.VirtualServerSpec{
+					Host:     "example.com",
+					Listener: listener,
+				},
+			},
+		}
+	}
+	now := time.Now()
+	publicVSEx := newVSEx("public-vs", now, &conf_v1.VirtualServerListener{HTTP: "http-8083", HTTPS: "https-8443"})
+	internalVSEx := newVSEx("internal-vs", now.Add(time.Minute), &conf_v1.VirtualServerListener{HTTP: "http-9083", HTTPS: "https-9443"})
+
+	// Both VirtualServers share the host's server zone; the oldest owns its labels regardless of sync order.
+	addOrUpdate(publicVSEx)
+	addOrUpdate(internalVSEx)
+	addOrUpdate(publicVSEx)
+	addOrUpdate(internalVSEx)
+
+	expectedServerZoneLabels := map[string][]string{
+		"example.com": {"virtualserver", "public-vs", "default"},
+	}
+	if diff := cmp.Diff(expectedServerZoneLabels, labelUpdater.serverZoneLabels); diff != "" {
+		t.Errorf("updateVirtualServerMetricsLabels() server zone labels mismatch (-want +got):\n%s", diff)
+	}
+
+	// Moving the owner to another host hands the shared zone to the remaining VirtualServer.
+	movedPublicVSEx := newVSEx("public-vs", now, publicVSEx.VirtualServer.Spec.Listener)
+	movedPublicVSEx.VirtualServer.Spec.Host = "other.example.com"
+	addOrUpdate(movedPublicVSEx)
+
+	expectedServerZoneLabels = map[string][]string{
+		"example.com":       {"virtualserver", "internal-vs", "default"},
+		"other.example.com": {"virtualserver", "public-vs", "default"},
+	}
+	if diff := cmp.Diff(expectedServerZoneLabels, labelUpdater.serverZoneLabels); diff != "" {
+		t.Errorf("updateVirtualServerMetricsLabels() after host change server zone labels mismatch (-want +got):\n%s", diff)
+	}
+
+	// Moving it back makes it the owner again, and deleting it keeps the labels of the VirtualServer still using the zone.
+	addOrUpdate(publicVSEx)
+	deleteVS(publicVSEx)
+
+	expectedServerZoneLabels = map[string][]string{
+		"example.com": {"virtualserver", "internal-vs", "default"},
+	}
+	if diff := cmp.Diff(expectedServerZoneLabels, labelUpdater.serverZoneLabels); diff != "" {
+		t.Errorf("deleteVirtualServerMetricsLabels() server zone labels mismatch (-want +got):\n%s", diff)
+	}
+
+	// Deleting the last VirtualServer on the host removes the zone labels.
+	deleteVS(internalVSEx)
+
+	if diff := cmp.Diff(map[string][]string{}, labelUpdater.serverZoneLabels); diff != "" {
+		t.Errorf("deleteVirtualServerMetricsLabels() for last VirtualServer server zone labels mismatch (-want +got):\n%s", diff)
 	}
 }
 
@@ -2047,6 +2132,39 @@ func TestUpstreamsForHost_ReturnsUpstreamsNamesForValidHostname(t *testing.T) {
 	}
 
 	want := []string{"vs_default_test-vs_tea-app"}
+	got := tcnf.UpstreamsForHost("tea.example.com")
+	if !cmp.Equal(want, got) {
+		t.Error(cmp.Diff(want, got))
+	}
+}
+
+func TestUpstreamsForHost_ReturnsUpstreamsForAllVirtualServersOnHost(t *testing.T) {
+	t.Parallel()
+	tcnf := createTestConfigurator(t)
+
+	internalVSEx := &VirtualServerEx{
+		VirtualServer: &conf_v1.VirtualServer{
+			ObjectMeta: meta_v1.ObjectMeta{
+				Name:      "internal-vs",
+				Namespace: "default",
+			},
+			Spec: conf_v1.VirtualServerSpec{
+				Host:     "tea.example.com",
+				Listener: &conf_v1.VirtualServerListener{HTTP: "http-8083"},
+				Upstreams: []conf_v1.Upstream{
+					{
+						Name: "tea-admin",
+					},
+				},
+			},
+		},
+	}
+	tcnf.virtualServers = map[string]*VirtualServerEx{
+		"default/test-vs":     validVirtualServerExWithUpstreams,
+		"default/internal-vs": internalVSEx,
+	}
+
+	want := []string{"vs_default_internal-vs_tea-admin", "vs_default_test-vs_tea-app"}
 	got := tcnf.UpstreamsForHost("tea.example.com")
 	if !cmp.Equal(want, got) {
 		t.Error(cmp.Diff(want, got))

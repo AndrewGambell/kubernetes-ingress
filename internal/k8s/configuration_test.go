@@ -1980,7 +1980,7 @@ func TestHostCollisions(t *testing.T) {
 			Object:  vs,
 			IsError: false,
 			Reason:  nl.EventReasonRejected,
-			Message: "Host is taken by another resource",
+			Message: "host foo.example.com is taken by another resource",
 		},
 	}
 
@@ -2142,6 +2142,382 @@ func TestHostCollisions(t *testing.T) {
 	}
 	if diff := cmp.Diff(expectedProblems, problems); diff != "" {
 		t.Errorf("DeleteIngress() returned unexpected result (-want +got):\n%s", diff)
+	}
+}
+
+func TestHostCollisionsWithListeners(t *testing.T) {
+	t.Parallel()
+	configuration := createTestConfiguration()
+
+	// Create VirtualServers with different listener configurations
+	vs1 := createTestVirtualServerWithListeners("vs1", "foo.example.com", "http-8080", "https-8443")
+	vs2 := createTestVirtualServerWithListeners("vs2", "foo.example.com", "http-9080", "https-9443")
+	vs3 := createTestVirtualServerWithListeners("vs3", "foo.example.com", "http-8080", "https-9443") // HTTP listener overlaps with vs1
+	vs4 := createTestVirtualServerWithListeners("vs4", "foo.example.com", "http-9080", "https-8443") // HTTPS listener overlaps with vs2
+	vs5 := createTestVirtualServer("vs5", "foo.example.com")                                         // No listener specified
+
+	// Adjust creation times to ensure predictable ordering
+	now := metav1.Now()
+	vs1.CreationTimestamp = now
+	vs2.CreationTimestamp = metav1.NewTime(now.Add(1 * time.Second))
+	vs3.CreationTimestamp = metav1.NewTime(now.Add(2 * time.Second))
+	vs4.CreationTimestamp = metav1.NewTime(now.Add(3 * time.Second))
+	vs5.CreationTimestamp = metav1.NewTime(now.Add(4 * time.Second))
+
+	// Test 1: Add VirtualServer with listeners (http-8080/https-8443)
+	changes, problems := configuration.AddOrUpdateVirtualServer(vs1)
+	if len(changes) != 1 {
+		t.Errorf("AddOrUpdateVirtualServer(vs1) returned %d changes, expected 1", len(changes))
+	}
+	if len(problems) != 0 {
+		t.Errorf("AddOrUpdateVirtualServer(vs1) returned %d problems, expected 0", len(problems))
+	}
+
+	// Test 2: Add another VirtualServer with completely different listeners (http-9080/https-9443)
+	// This should succeed - no conflict
+	changes, problems = configuration.AddOrUpdateVirtualServer(vs2)
+	if len(changes) != 1 {
+		t.Errorf("AddOrUpdateVirtualServer(vs2) returned %d changes, expected 1", len(changes))
+	}
+	if len(problems) != 0 {
+		t.Errorf("AddOrUpdateVirtualServer(vs2) returned %d problems, expected 0", len(problems))
+	}
+
+	// Test 3: Add VirtualServer with HTTP listener overlap (http-8080 shared with vs1).
+	// vs3 must be rejected; the problem message must name the overlapping listener and vs1.
+	// vs1 must remain active and receive a symmetric warning, reported as a status-only update.
+	changes, problems = configuration.AddOrUpdateVirtualServer(vs3)
+	if len(changes) != 1 || changes[0].Op != UpdateStatus || changes[0].Resource.GetKeyWithKind() != "VirtualServer/default/vs1" {
+		t.Errorf("AddOrUpdateVirtualServer(vs3) changes = %v, expected single UpdateStatus of vs1", changes)
+	}
+	expectedProblems := []ConfigurationProblem{
+		{
+			Object:  vs3,
+			IsError: false,
+			Reason:  nl.EventReasonRejected,
+			Message: "host foo.example.com with listeners (http:http-8080, https:https-9443) conflicts with VirtualServer default/vs1",
+		},
+	}
+	if diff := cmp.Diff(expectedProblems, problems); diff != "" {
+		t.Errorf("AddOrUpdateVirtualServer(vs3) problems mismatch (-want +got):\n%s", diff)
+	}
+	vs1Key := hostListenerKey("foo.example.com", vs1.Spec.Listener)
+	if resource := configuration.hosts[vs1Key]; resource == nil || resource.GetKeyWithKind() != "VirtualServer/default/vs1" {
+		t.Errorf("vs1 should still be active after vs3 conflict")
+	}
+
+	// Test 4: Add VirtualServer with HTTPS listener overlap (https-8443 shared with vs1).
+	// vs4 conflicts with vs1 on the HTTPS listener and must be rejected; vs1 gains another warning.
+	changes, problems = configuration.AddOrUpdateVirtualServer(vs4)
+	if len(changes) != 1 || changes[0].Op != UpdateStatus || changes[0].Resource.GetKeyWithKind() != "VirtualServer/default/vs1" {
+		t.Errorf("AddOrUpdateVirtualServer(vs4) changes = %v, expected single UpdateStatus of vs1", changes)
+	}
+	expectedProblems = []ConfigurationProblem{
+		{
+			Object:  vs4,
+			IsError: false,
+			Reason:  nl.EventReasonRejected,
+			Message: "host foo.example.com with listeners (http:http-9080, https:https-8443) conflicts with VirtualServer default/vs1",
+		},
+	}
+	if diff := cmp.Diff(expectedProblems, problems); diff != "" {
+		t.Errorf("AddOrUpdateVirtualServer(vs4) problems mismatch (-want +got):\n%s", diff)
+	}
+
+	// Test 5: Add VirtualServer without listeners
+	// This should conflict with all existing VirtualServers on the same hostname; vs1 is reported first.
+	changes, problems = configuration.AddOrUpdateVirtualServer(vs5)
+	if len(changes) != 1 || changes[0].Op != UpdateStatus || changes[0].Resource.GetKeyWithKind() != "VirtualServer/default/vs1" {
+		t.Errorf("AddOrUpdateVirtualServer(vs5) changes = %v, expected single UpdateStatus of vs1", changes)
+	}
+	if len(problems) == 0 {
+		t.Errorf("AddOrUpdateVirtualServer(vs5) should have problems (no listener conflicts with all)")
+	}
+	if len(problems) > 0 && problems[0].Reason != nl.EventReasonRejected {
+		t.Errorf("AddOrUpdateVirtualServer(vs5) problem reason = %v, expected %v", problems[0].Reason, nl.EventReasonRejected)
+	}
+
+	// Test 6: Delete vs1. With vs1 gone, vs2 becomes the only active VS on the host.
+	// vs3/vs4/vs5 are re-evaluated and rejected against vs2. vs2's config is unchanged.
+	changes, problems = configuration.DeleteVirtualServer("default/vs1")
+	// vs1 is deleted; vs2 now carries the conflict warnings, so only its status is updated.
+	if len(changes) != 2 ||
+		changes[0].Op != Delete || changes[0].Resource.GetKeyWithKind() != "VirtualServer/default/vs1" ||
+		changes[1].Op != UpdateStatus || changes[1].Resource.GetKeyWithKind() != "VirtualServer/default/vs2" {
+		t.Errorf("DeleteVirtualServer(vs1) changes = %v, expected Delete of vs1 and UpdateStatus of vs2", changes)
+	}
+	// vs3 (https-9443 shared with vs2), vs4 (http-9080 shared with vs2), vs5 (no listener)
+	// are all rejected against vs2.
+	expectedProblems = []ConfigurationProblem{
+		{
+			Object:  vs3,
+			IsError: false,
+			Reason:  nl.EventReasonRejected,
+			Message: "host foo.example.com with listeners (http:http-8080, https:https-9443) conflicts with VirtualServer default/vs2",
+		},
+		{
+			Object:  vs4,
+			IsError: false,
+			Reason:  nl.EventReasonRejected,
+			Message: "host foo.example.com with listeners (http:http-9080, https:https-8443) conflicts with VirtualServer default/vs2",
+		},
+		{
+			Object:  vs5,
+			IsError: false,
+			Reason:  nl.EventReasonRejected,
+			Message: "host foo.example.com with listeners (http:default, https:default) conflicts with VirtualServer default/vs2",
+		},
+	}
+	if diff := cmp.Diff(expectedProblems, problems); diff != "" {
+		t.Errorf("DeleteVirtualServer(vs1) problems mismatch (-want +got):\n%s", diff)
+	}
+
+	// Test 7: vs2 is still accessible under its composite key; vs1's key is gone.
+	vs2Key := hostListenerKey("foo.example.com", vs2.Spec.Listener)
+	if resource := configuration.hosts[vs2Key]; resource == nil || resource.GetKeyWithKind() != "VirtualServer/default/vs2" {
+		t.Errorf("vs2 should still be active after vs1 deletion")
+	}
+	vs1Key = hostListenerKey("foo.example.com", vs1.Spec.Listener)
+	if _, exists := configuration.hosts[vs1Key]; exists {
+		t.Errorf("vs1 key should be gone from hosts map after deletion")
+	}
+
+	// Test 8: A VS with a third distinct listener pair must be accepted alongside vs2.
+	vs6 := createTestVirtualServerWithListeners("vs6", "foo.example.com", "http-7070", "https-7443")
+	vs6.CreationTimestamp = metav1.NewTime(now.Add(5 * time.Second))
+	changes, problems = configuration.AddOrUpdateVirtualServer(vs6)
+	if len(changes) != 1 {
+		t.Errorf("AddOrUpdateVirtualServer(vs6) returned %d changes, expected 1", len(changes))
+	}
+	if len(problems) != 0 {
+		t.Errorf("AddOrUpdateVirtualServer(vs6) returned unexpected problems: %v", problems)
+	}
+	vs6Key := hostListenerKey("foo.example.com", vs6.Spec.Listener)
+	if resource := configuration.hosts[vs6Key]; resource == nil || resource.GetKeyWithKind() != "VirtualServer/default/vs6" {
+		t.Errorf("vs6 should be active with no listener conflicts")
+	}
+}
+
+func TestHostCollisionVirtualServerVsIngress(t *testing.T) {
+	t.Parallel()
+	configuration := createTestConfiguration()
+
+	// Ingress claims foo.example.com first.
+	ing := createTestIngress("ing", "foo.example.com")
+	changes, problems := configuration.AddOrUpdateIngress(ing)
+	if len(changes) != 1 || len(problems) != 0 {
+		t.Fatalf("AddOrUpdateIngress() got changes=%d problems=%d, want 1/0", len(changes), len(problems))
+	}
+
+	// VirtualServer with a custom listener tries to claim the same host.
+	// The Ingress already holds the bare-hostname key; the VS must be rejected.
+	vs := createTestVirtualServerWithListeners("vs", "foo.example.com", "http-8080", "https-8443")
+	changes, problems = configuration.AddOrUpdateVirtualServer(vs)
+	if len(changes) != 0 {
+		t.Errorf("AddOrUpdateVirtualServer() returned %d changes, expected 0", len(changes))
+	}
+	expectedProblems := []ConfigurationProblem{
+		{
+			Object:  vs,
+			IsError: false,
+			Reason:  nl.EventReasonRejected,
+			Message: "host foo.example.com is taken by another resource",
+		},
+	}
+	if diff := cmp.Diff(expectedProblems, problems); diff != "" {
+		t.Errorf("AddOrUpdateVirtualServer() problems mismatch (-want +got):\n%s", diff)
+	}
+
+	// The Ingress must still own the host.
+	if resource := configuration.hosts["foo.example.com"]; resource == nil || resource.GetKeyWithKind() != "Ingress/default/ing" {
+		t.Errorf("Ingress should still own foo.example.com, got %v", resource)
+	}
+
+	// Delete the Ingress; the rebuild triggered by DeleteIngress must activate the VS.
+	changes, problems = configuration.DeleteIngress("default/ing")
+	if len(problems) != 0 {
+		t.Errorf("DeleteIngress() returned unexpected problems: %v", problems)
+	}
+	vsKey := hostListenerKey("foo.example.com", vs.Spec.Listener)
+	if resource := configuration.hosts[vsKey]; resource == nil || resource.GetKeyWithKind() != "VirtualServer/default/vs" {
+		t.Errorf("VS should own its composite host key after Ingress deletion")
+	}
+	// The VS must appear as an AddOrUpdate in the changes emitted by DeleteIngress.
+	var vsActivated bool
+	for _, c := range changes {
+		if c.Op == AddOrUpdate && c.Resource.GetKeyWithKind() == "VirtualServer/default/vs" {
+			vsActivated = true
+		}
+	}
+	if !vsActivated {
+		t.Errorf("DeleteIngress() should have emitted AddOrUpdate for the now-active VS, changes = %v", changes)
+	}
+}
+
+func TestVirtualServerRouteOrphanWithListeners(t *testing.T) {
+	t.Parallel()
+	configuration := createTestConfiguration()
+
+	// Add a VSR before its parent VS exists.
+	vsr := createTestVirtualServerRoute("vsr-1", "default", "foo.example.com", "/tea")
+	changes, problems := configuration.AddOrUpdateVirtualServerRoute(vsr)
+	if len(changes) != 0 {
+		t.Errorf("AddOrUpdateVirtualServerRoute() returned %d changes, expected 0", len(changes))
+	}
+	if len(problems) != 1 || problems[0].Reason != nl.EventReasonNoVirtualServerFound {
+		t.Errorf("AddOrUpdateVirtualServerRoute() expected NoVirtualServerFound problem, got %v", problems)
+	}
+
+	// Add a VirtualServer with a custom listener that owns the VSR.
+	vs := createTestVirtualServerWithListeners("vs-1", "foo.example.com", "http-8080", "https-8443")
+	vs.Spec.Routes = []conf_v1.Route{
+		{Path: "/tea", Route: "vsr-1"},
+	}
+	changes, problems = configuration.AddOrUpdateVirtualServer(vs)
+	if len(changes) != 1 {
+		t.Errorf("AddOrUpdateVirtualServer() returned %d changes, expected 1", len(changes))
+	}
+	if len(problems) != 0 {
+		t.Errorf("AddOrUpdateVirtualServer() returned unexpected problems: %v", problems)
+	}
+
+	// Add a second VirtualServer on the same host with different listeners — should coexist.
+	vs2 := createTestVirtualServerWithListeners("vs-2", "foo.example.com", "http-9080", "https-9443")
+	changes, problems = configuration.AddOrUpdateVirtualServer(vs2)
+	if len(changes) != 1 {
+		t.Errorf("AddOrUpdateVirtualServer(vs-2) returned %d changes, expected 1", len(changes))
+	}
+	if len(problems) != 0 {
+		t.Errorf("AddOrUpdateVirtualServer(vs-2) returned unexpected problems: %v", problems)
+	}
+
+	// The VSR must have no problem at all — vs-1 (custom listener) owns it, even though vs-2 shares the host.
+	if p, exists := configuration.hostProblems["VirtualServerRoute/default/vsr-1"]; exists {
+		t.Errorf("VSR owned by a custom-listener VS has unexpected problem: %v", p)
+	}
+
+	// A second VSR on the same host that neither VS references is ignored, not orphaned.
+	vsr2 := createTestVirtualServerRoute("vsr-2", "default", "foo.example.com", "/coffee")
+	_, problems = configuration.AddOrUpdateVirtualServerRoute(vsr2)
+	expectedProblems := []ConfigurationProblem{
+		{
+			Object:  vsr2,
+			IsError: false,
+			Reason:  nl.EventReasonIgnored,
+			Message: "VirtualServer default/vs-1 ignores VirtualServerRoute",
+		},
+	}
+	if diff := cmp.Diff(expectedProblems, problems); diff != "" {
+		t.Errorf("AddOrUpdateVirtualServerRoute(vsr-2) problems mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestHostCollisionsWithListenersOlderVirtualServerWins(t *testing.T) {
+	t.Parallel()
+	configuration := createTestConfiguration()
+
+	// The newer VS sorts first by name; the older VS must still keep the listeners.
+	now := metav1.Now()
+	older := createTestVirtualServerWithListeners("zeta", "foo.example.com", "http-8080", "https-8443")
+	older.CreationTimestamp = now
+	newer := createTestVirtualServerWithListeners("alpha", "foo.example.com", "http-8080", "https-9443")
+	newer.CreationTimestamp = metav1.NewTime(now.Add(time.Minute))
+
+	configuration.AddOrUpdateVirtualServer(older)
+	changes, problems := configuration.AddOrUpdateVirtualServer(newer)
+
+	if len(changes) != 1 || changes[0].Op != UpdateStatus || changes[0].Resource.GetKeyWithKind() != "VirtualServer/default/zeta" {
+		t.Errorf("AddOrUpdateVirtualServer(newer) changes = %v, expected single UpdateStatus of zeta", changes)
+	}
+	expectedProblems := []ConfigurationProblem{
+		{
+			Object:  newer,
+			IsError: false,
+			Reason:  nl.EventReasonRejected,
+			Message: "host foo.example.com with listeners (http:http-8080, https:https-9443) conflicts with VirtualServer default/zeta",
+		},
+	}
+	if diff := cmp.Diff(expectedProblems, problems); diff != "" {
+		t.Errorf("AddOrUpdateVirtualServer(newer) problems mismatch (-want +got):\n%s", diff)
+	}
+	if resource := configuration.hosts[hostListenerKey("foo.example.com", older.Spec.Listener)]; resource == nil || resource.GetKeyWithKind() != "VirtualServer/default/zeta" {
+		t.Errorf("older VS should keep its listeners, got %v", resource)
+	}
+}
+
+func TestHostCollisionTLSPassthroughBlocksCustomListenerVirtualServer(t *testing.T) {
+	t.Parallel()
+	configuration := createTestConfiguration()
+
+	vs := createTestVirtualServerWithListeners("vs", "foo.example.com", "http-8080", "https-8443")
+	vsKey := hostListenerKey("foo.example.com", vs.Spec.Listener)
+	configuration.AddOrUpdateVirtualServer(vs)
+
+	// A TLS Passthrough TransportServer claims the bare hostname; like an Ingress, it blocks the custom-listener VS.
+	ts := createTestTLSPassthroughTransportServer("ts", "foo.example.com")
+	changes, problems := configuration.AddOrUpdateTransportServer(ts)
+
+	var vsDeleted, tsAdded bool
+	for _, c := range changes {
+		switch {
+		case c.Op == Delete && c.Resource.GetKeyWithKind() == "VirtualServer/default/vs":
+			vsDeleted = true
+		case c.Op == AddOrUpdate && c.Resource.GetKeyWithKind() == "TransportServer/default/ts":
+			tsAdded = true
+		}
+	}
+	if !vsDeleted || !tsAdded {
+		t.Errorf("AddOrUpdateTransportServer() changes = %v, expected Delete of vs and AddOrUpdate of ts", changes)
+	}
+	expectedProblems := []ConfigurationProblem{
+		{
+			Object:  vs,
+			IsError: false,
+			Reason:  nl.EventReasonRejected,
+			Message: "host foo.example.com is taken by another resource",
+		},
+	}
+	if diff := cmp.Diff(expectedProblems, problems); diff != "" {
+		t.Errorf("AddOrUpdateTransportServer() problems mismatch (-want +got):\n%s", diff)
+	}
+	if _, exists := configuration.hosts[vsKey]; exists {
+		t.Errorf("custom-listener VS should not hold its host key while a TLS Passthrough TransportServer holds the host")
+	}
+
+	// Deleting the TransportServer reactivates the VS.
+	configuration.DeleteTransportServer("default/ts")
+	if resource := configuration.hosts[vsKey]; resource == nil || resource.GetKeyWithKind() != "VirtualServer/default/vs" {
+		t.Errorf("VS should own its host key after TransportServer deletion, got %v", resource)
+	}
+}
+
+func TestHostCollisionProblemMessageIgnoresUnrelatedWarnings(t *testing.T) {
+	t.Parallel()
+	configuration := createTestConfiguration()
+
+	now := metav1.Now()
+	vs1 := createTestVirtualServerWithListeners("vs1", "foo.example.com", "http-8080", "https-8443")
+	vs1.CreationTimestamp = now
+	configuration.AddOrUpdateVirtualServer(vs1)
+
+	// vs2 references a missing VSR, which adds a warning before its listener conflict is detected.
+	vs2 := createTestVirtualServerWithListeners("vs2", "foo.example.com", "http-8080", "https-9443")
+	vs2.CreationTimestamp = metav1.NewTime(now.Add(time.Minute))
+	vs2.Spec.Routes = []conf_v1.Route{
+		{Path: "/tea", Route: "missing"},
+	}
+	_, problems := configuration.AddOrUpdateVirtualServer(vs2)
+
+	expectedProblems := []ConfigurationProblem{
+		{
+			Object:  vs2,
+			IsError: false,
+			Reason:  nl.EventReasonRejected,
+			Message: "host foo.example.com with listeners (http:http-8080, https:https-9443) conflicts with VirtualServer default/vs1",
+		},
+	}
+	if diff := cmp.Diff(expectedProblems, problems); diff != "" {
+		t.Errorf("AddOrUpdateVirtualServer(vs2) problems mismatch (-want +got):\n%s", diff)
 	}
 }
 
@@ -6364,9 +6740,10 @@ func TestMisconfiguredListenerWarnings_StableForSharedHost(t *testing.T) {
 	configuration.AddOrUpdateVirtualServer(first)
 	configuration.AddOrUpdateVirtualServer(second)
 
+	// Both share https-8442, so bbb is rejected and only aaa's own listener warning is reported on aaa.
 	want := []string{
+		"host cafe.example.com with listeners (http:http-bogus-a, https:https-8442) conflicts with VirtualServer default/bbb",
 		"Listener http-bogus-a is not defined in GlobalConfiguration",
-		"Listener http-bogus-b is not defined in GlobalConfiguration",
 	}
 
 	for i := range 100 {
@@ -6378,7 +6755,7 @@ func TestMisconfiguredListenerWarnings_StableForSharedHost(t *testing.T) {
 			}
 		}
 
-		winner, ok := configuration.hosts[host].(*VirtualServerConfiguration)
+		winner, ok := configuration.hosts[hostListenerKey(host, first.Spec.Listener)].(*VirtualServerConfiguration)
 		if !ok {
 			t.Fatalf("host %s is not a VirtualServerConfiguration", host)
 		}

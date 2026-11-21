@@ -3432,7 +3432,9 @@ spec:
                   subdomain as defined in RFC 1123, such as my-app or hello.example.com.
                   When using a wildcard domain like *.example.com the domain must
                   be contained in double quotes. The host value needs to be unique
-                  among all Ingress and VirtualServer resources.
+                  among all Ingress and VirtualServer resources, unless it is shared
+                  only by VirtualServers whose custom listeners (listener.http and
+                  listener.https) do not overlap.
                 type: string
               http-snippets:
                 description: Sets a custom snippet in the http context.

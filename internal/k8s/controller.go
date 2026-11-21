@@ -3870,7 +3870,7 @@ func (lbc *LoadBalancerController) createVirtualServerEx(virtualServer *conf_v1.
 
 	l := lbc.Logger.With(logNamespaceKey, virtualServer.GetNamespace(), logKindKey, virtualServerKind, logNameKey, virtualServer.GetName())
 
-	resource := lbc.configuration.hosts[virtualServer.Spec.Host]
+	resource := lbc.configuration.hosts[hostListenerKey(virtualServer.Spec.Host, virtualServer.Spec.Listener)]
 	if vsc, ok := resource.(*VirtualServerConfiguration); ok {
 		virtualServerEx.HTTPPort = vsc.HTTPPort
 		virtualServerEx.HTTPSPort = vsc.HTTPSPort

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 
@@ -360,14 +361,16 @@ func (cnf *Configurator) AddOrUpdateIngresses(ingExes []*IngressEx) (Warnings, e
 	return allWarnings, nil
 }
 
-// virtualServerExForHost takes a hostname and returns a VirtualServerEx for the given hostname.
-func (cnf *Configurator) virtualServerExForHost(hostname string) *VirtualServerEx {
-	for _, vsEx := range cnf.virtualServers {
-		if vsEx.VirtualServer.Spec.Host == hostname {
-			return vsEx
+// virtualServerExesForHost takes a hostname and returns the VirtualServerExes for the given hostname,
+// sorted by key. More than one VirtualServer can use a hostname when they are on different listeners.
+func (cnf *Configurator) virtualServerExesForHost(hostname string) []*VirtualServerEx {
+	var vsExes []*VirtualServerEx
+	for _, key := range slices.Sorted(maps.Keys(cnf.virtualServers)) {
+		if vsEx := cnf.virtualServers[key]; vsEx.VirtualServer.Spec.Host == hostname {
+			vsExes = append(vsExes, vsEx)
 		}
 	}
-	return nil
+	return vsExes
 }
 
 // upstreamsForVirtualServer takes a VirtualServerEx and returns a list of associated upstreams.
@@ -399,15 +402,15 @@ func (cnf *Configurator) upstreamsForVirtualServer(vsEx *VirtualServerEx) []stri
 	return upstreamNames
 }
 
-// UpstreamsForHost takes a hostname and returns upstreams for the given hostname.
+// UpstreamsForHost takes a hostname and returns upstreams for all VirtualServers on the given hostname.
 func (cnf *Configurator) UpstreamsForHost(hostname string) []string {
 	l := nl.LoggerFromContext(cnf.CfgParams.Context)
 	nl.Debugf(l, "Get upstream for host: %s", hostname)
-	vsEx := cnf.virtualServerExForHost(hostname)
-	if vsEx != nil {
-		return cnf.upstreamsForVirtualServer(vsEx)
+	var upstreamNames []string
+	for _, vsEx := range cnf.virtualServerExesForHost(hostname) {
+		upstreamNames = append(upstreamNames, cnf.upstreamsForVirtualServer(vsEx)...)
 	}
-	return nil
+	return upstreamNames
 }
 
 // StreamUpstreamsForName takes a name and returns stream upstreams
@@ -681,20 +684,10 @@ func (cnf *Configurator) updateVirtualServerMetricsLabels(virtualServerEx *Virtu
 		cnf.labelUpdater.UpdateUpstreamServerLabels(labels)
 		cnf.labelUpdater.DeleteUpstreamServerLabels(removedUpstreams)
 
-		serverZoneLabels := make(map[string][]string)
-		newZones := make(map[string]bool)
-		newZonesNames := []string{virtualServerEx.VirtualServer.Spec.Host}
-
-		serverZoneLabels[virtualServerEx.VirtualServer.Spec.Host] = []string{
-			"virtualserver", virtualServerEx.VirtualServer.Name, virtualServerEx.VirtualServer.Namespace,
-		}
-
-		newZones[virtualServerEx.VirtualServer.Spec.Host] = true
-
-		removedZones := findRemovedKeys(cnf.metricLabelsIndex.virtualServerServerZones[key], newZones)
-		cnf.metricLabelsIndex.virtualServerServerZones[key] = newZonesNames
-		cnf.labelUpdater.UpdateServerZoneLabels(serverZoneLabels)
-		cnf.labelUpdater.DeleteServerZoneLabels(removedZones)
+		zoneName := virtualServerEx.VirtualServer.Spec.Host
+		removedZones := findRemovedKeys(cnf.metricLabelsIndex.virtualServerServerZones[key], map[string]bool{zoneName: true})
+		cnf.metricLabelsIndex.virtualServerServerZones[key] = []string{zoneName}
+		cnf.updateVirtualServerServerZoneLabels(append(removedZones, zoneName))
 	}
 }
 
@@ -705,13 +698,60 @@ func (cnf *Configurator) deleteVirtualServerMetricsLabels(key string) {
 
 	if cnf.isPlus {
 		cnf.labelUpdater.DeleteUpstreamServerLabels(cnf.metricLabelsIndex.virtualServerUpstreams[key])
-		cnf.labelUpdater.DeleteServerZoneLabels(cnf.metricLabelsIndex.virtualServerServerZones[key])
+		cnf.updateVirtualServerServerZoneLabels(cnf.metricLabelsIndex.virtualServerServerZones[key])
 		cnf.labelUpdater.DeleteUpstreamServerPeerLabels(cnf.metricLabelsIndex.virtualServerUpstreamPeers[key])
 	}
 
 	delete(cnf.metricLabelsIndex.virtualServerUpstreams, key)
 	delete(cnf.metricLabelsIndex.virtualServerServerZones, key)
 	delete(cnf.metricLabelsIndex.virtualServerUpstreamPeers, key)
+}
+
+// updateVirtualServerServerZoneLabels sets the labels of each server zone to its owning VirtualServer,
+// or deletes them once no VirtualServer uses the zone. It must be called after cnf.virtualServers is updated.
+func (cnf *Configurator) updateVirtualServerServerZoneLabels(zoneNames []string) {
+	serverZoneLabels := make(map[string][]string)
+	var removedZones []string
+
+	for _, zoneName := range zoneNames {
+		owner := cnf.serverZoneOwner(zoneName)
+		if owner == nil {
+			removedZones = append(removedZones, zoneName)
+			continue
+		}
+		serverZoneLabels[zoneName] = []string{"virtualserver", owner.Name, owner.Namespace}
+	}
+
+	cnf.labelUpdater.UpdateServerZoneLabels(serverZoneLabels)
+	cnf.labelUpdater.DeleteServerZoneLabels(removedZones)
+}
+
+// serverZoneOwner returns the VirtualServer whose labels are attached to the server zone of the host.
+// VirtualServers on different listeners share the zone of their host, so the oldest one owns it,
+// consistent with how host conflicts are resolved. This keeps the labels stable as the VirtualServers sync.
+func (cnf *Configurator) serverZoneOwner(host string) *conf_v1.VirtualServer {
+	var owner *conf_v1.VirtualServer
+	for _, vsEx := range cnf.virtualServers {
+		vs := vsEx.VirtualServer
+		if vs.Spec.Host != host {
+			continue
+		}
+		if owner == nil || isOlderVirtualServer(vs, owner) {
+			owner = vs
+		}
+	}
+	return owner
+}
+
+// isOlderVirtualServer reports whether vs1 is older than vs2, breaking ties by UID and then by namespace/name.
+func isOlderVirtualServer(vs1, vs2 *conf_v1.VirtualServer) bool {
+	if !vs1.CreationTimestamp.Equal(&vs2.CreationTimestamp) {
+		return vs1.CreationTimestamp.Before(&vs2.CreationTimestamp)
+	}
+	if vs1.UID != vs2.UID {
+		return vs1.UID > vs2.UID
+	}
+	return generateNamespaceNameKey(&vs1.ObjectMeta) < generateNamespaceNameKey(&vs2.ObjectMeta)
 }
 
 // GetVirtualServerWarnings returns the warnings produced when the VirtualServer
