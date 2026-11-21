@@ -1992,6 +1992,28 @@
                 ""
               ]
             },
+            "discoverListenerServices": {
+              "type": "boolean",
+              "default": false,
+              "title": "The discoverListenerServices",
+              "examples": [
+                false
+              ]
+            },
+            "discoverListenerServiceNames": {
+              "type": "array",
+              "default": [],
+              "title": "The discoverListenerServiceNames",
+              "items": {
+                "type": "string",
+                "pattern": "^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$"
+              },
+              "examples": [
+                [
+                  "nginx-ingress-public"
+                ]
+              ]
+            },
             "enableLeaderElection": {
               "type": "boolean",
               "default": false,
@@ -2019,6 +2041,8 @@
               "enable": true,
               "externalService": "",
               "ingressLink": "",
+              "discoverListenerServices": false,
+              "discoverListenerServiceNames": [],
               "enableLeaderElection": true,
               "leaderElectionLockName": "",
               "annotations": {}
@@ -2566,6 +2590,8 @@
             "enable": true,
             "externalService": "",
             "ingressLink": "",
+            "discoverListenerServices": false,
+            "discoverListenerServiceNames": [],
             "enableLeaderElection": true,
             "leaderElectionLockName": "",
             "annotations": {}

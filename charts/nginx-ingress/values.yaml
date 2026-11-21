@@ -686,6 +686,16 @@ controller:
     ## controller.reportIngressStatus.enable must be set to true.
     ingressLink: ""
 
+    ## Reports VirtualServer and VirtualServerRoute endpoints from every LoadBalancer Service in the release namespace that selects the
+    ## Ingress Controller pods and exposes the VirtualServer's listener ports. Only addresses in each Service's status.loadBalancer.ingress are reported.
+    ## Replaces controller.reportIngressStatus.externalService and cannot be combined with it or with controller.reportIngressStatus.ingressLink.
+    ## controller.reportIngressStatus.enable and controller.enableCustomResources must be set to true.
+    discoverListenerServices: false
+
+    ## Restricts controller.reportIngressStatus.discoverListenerServices to these Service names in the release namespace.
+    ## When empty, every LoadBalancer Service that selects the Ingress Controller pods is eligible.
+    discoverListenerServiceNames: []
+
     ## Enable Leader election to avoid multiple replicas of the controller reporting the status of Ingress resources. controller.reportIngressStatus.enable must be set to true.
     enableLeaderElection: true
 

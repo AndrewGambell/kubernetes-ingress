@@ -124,6 +124,36 @@ that was deployed in Step 1. Below is the yaml of this example VirtualServer:
     kubectl create -f cafe-virtual-server.yaml
     ```
 
+### Discover external endpoints for custom listeners
+
+Set `-discover-listener-services` to report endpoints from multiple LoadBalancer
+Services in VirtualServer and VirtualServerRoute status. With Helm, set both
+`controller.reportIngressStatus.enable` and
+`controller.reportIngressStatus.discoverListenerServices` to `true`. Discovery
+requires custom resources and is incompatible with `-external-service` and
+`-ingresslink`. The `external-status-address` ConfigMap setting takes precedence.
+
+Discovery uses Services in the controller namespace that select its Pods. If you
+restrict namespace watches, include that namespace in `-watch-namespace` or label
+it to match `-watch-namespace-label`. Otherwise, the controller logs a warning
+and reports no discovered endpoints.
+
+The controller matches a Service's TCP `targetPort` to the listener port and
+reports the Service's `port` with each IP or hostname in `status.loadBalancer.ingress`.
+For example, a Service with `port: 443` and `targetPort: 8443` reports port `443`
+for a listener on `8443`. The controller uses EndpointSlices to resolve named
+target ports and check backend addresses for listeners bound to a specific IP.
+
+To limit discovery by name, pass a comma-separated list to
+`-discover-listener-service-names`. With Helm, set
+`controller.reportIngressStatus.discoverListenerServiceNames` to a list of names.
+Discovery ignores `spec.externalIPs`, which Service editors can set. If you use
+ExternalDNS, restrict who can create Services in the controller namespace, since
+ExternalDNS can publish DNS records from the reported endpoints.
+
+If controllers with different leader-election locks watch the same VirtualServer,
+configure discovery so they report the same endpoints.
+
 ## Step 4 - Test the Configuration
 
 1. Check that the configuration has been successfully applied by inspecting the events of the VirtualServer:

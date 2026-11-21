@@ -1,0 +1,6 @@
+controller:
+  reportIngressStatus:
+    discoverListenerServices: true
+    discoverListenerServiceNames:
+      - nginx-ingress-public
+      - nginx-ingress-internal

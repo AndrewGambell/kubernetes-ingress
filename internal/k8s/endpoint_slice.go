@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"reflect"
 
+	v1 "k8s.io/api/core/v1"
 	discovery_v1 "k8s.io/api/discovery/v1"
 	"k8s.io/client-go/tools/cache"
 
@@ -85,11 +86,24 @@ func (lbc *LoadBalancerController) syncEndpointSlices(task task) {
 	}
 
 	if !endpointSliceExists {
+		// A deleted EndpointSlice no longer names its Service, so refresh unconditionally.
+		if err := lbc.refreshDiscoveredEndpoints(ns); err != nil {
+			lbc.syncQueue.Requeue(task, err)
+		}
 		return
 	}
 
 	endpointSlice := obj.(*discovery_v1.EndpointSlice)
 	svcName := endpointSlice.Labels["kubernetes.io/service-name"]
+	if lbc.statusUpdater.listenerDiscovery != nil {
+		var svc *v1.Service
+		if svcObj, svcExists, err := nsi.svcLister.GetByKey(ns + "/" + svcName); err == nil && svcExists {
+			svc = svcObj.(*v1.Service)
+		}
+		if err := lbc.refreshDiscoveredEndpointsForService(ns, svcName, svc); err != nil {
+			lbc.syncQueue.Requeue(task, err)
+		}
+	}
 	svcResource := lbc.configuration.FindResourcesForService(endpointSlice.Namespace, svcName)
 
 	// check if this is the endpointslice for the controller's own service

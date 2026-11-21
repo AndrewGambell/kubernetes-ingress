@@ -323,6 +323,8 @@ func main() {
 		IsNginxPlus:                  *nginxPlus,
 		IngressClass:                 *ingressClass,
 		ExternalServiceName:          *externalService,
+		DiscoverListenerServices:     *discoverListenerServices,
+		ListenerServiceNames:         listenerServiceNames,
 		IngressLink:                  *ingressLink,
 		ControllerNamespace:          controllerNamespace,
 		Pod:                          pod,

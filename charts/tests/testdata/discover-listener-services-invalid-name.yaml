@@ -1,0 +1,5 @@
+controller:
+  reportIngressStatus:
+    discoverListenerServices: true
+    discoverListenerServiceNames:
+      - Invalid_Name

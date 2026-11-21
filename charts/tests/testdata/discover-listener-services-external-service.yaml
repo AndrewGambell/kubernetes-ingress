@@ -1,0 +1,4 @@
+controller:
+  reportIngressStatus:
+    discoverListenerServices: true
+    externalService: nginx-ingress-public

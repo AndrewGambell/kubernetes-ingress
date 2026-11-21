@@ -239,6 +239,24 @@ func TestParseLatencyBuckets(t *testing.T) {
 	}
 }
 
+func TestParseServiceNames(t *testing.T) {
+	t.Parallel()
+
+	got, err := parseServiceNames("public, internal-lb")
+	if err != nil {
+		t.Fatalf("parseServiceNames returned error: %v", err)
+	}
+	if want := []string{"public", "internal-lb"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("parseServiceNames() = %v, want %v", got, want)
+	}
+
+	for _, input := range []string{"public,", "Public", "ns/public", "1public", "public;internal"} {
+		if _, err := parseServiceNames(input); err == nil {
+			t.Errorf("parseServiceNames(%q) returned no error", input)
+		}
+	}
+}
+
 func TestValidatePLMSecretRef(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

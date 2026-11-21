@@ -268,6 +268,11 @@ func TestHelmNICTemplate(t *testing.T) {
 			releaseName: "latency-metrics-buckets",
 			namespace:   "default",
 		},
+		"discoverListenerServices": {
+			valuesFile:  "testdata/discover-listener-services.yaml",
+			releaseName: "discover-listener-services",
+			namespace:   "default",
+		},
 		"allowEmptyIngressHostWithoutCRs": {
 			valuesFile:  "testdata/allow-empty-ingress-host-no-crs.yaml",
 			releaseName: "allow-empty-ingress-host-no-crs",
@@ -407,6 +412,24 @@ func TestHelmNICTemplateNegative(t *testing.T) {
 			releaseName:       "additional-service-reserved-label",
 			namespace:         "default",
 			expectedErrorMsgs: []string{`label "app.kubernetes.io/managed-by" is managed by the chart and cannot be overridden`},
+		},
+		"discoverListenerServicesWithExternalService": {
+			valuesFile:        "testdata/discover-listener-services-external-service.yaml",
+			releaseName:       "discover-listener-services-external-service",
+			namespace:         "default",
+			expectedErrorMsgs: []string{"controller.reportIngressStatus.discoverListenerServices cannot be combined with controller.reportIngressStatus.externalService or controller.reportIngressStatus.ingressLink"},
+		},
+		"discoverListenerServicesWithoutCRs": {
+			valuesFile:        "testdata/discover-listener-services-no-crs.yaml",
+			releaseName:       "discover-listener-services-no-crs",
+			namespace:         "default",
+			expectedErrorMsgs: []string{"controller.reportIngressStatus.discoverListenerServices requires controller.enableCustomResources=true"},
+		},
+		"discoverListenerServicesInvalidName": {
+			valuesFile:        "testdata/discover-listener-services-invalid-name.yaml",
+			releaseName:       "discover-listener-services-invalid-name",
+			namespace:         "default",
+			expectedErrorMsgs: []string{"'Invalid_Name' does not match pattern"},
 		},
 		"latencyMetricsBucketsInvalid": {
 			valuesFile:        "testdata/latency-metrics-buckets-invalid.yaml",

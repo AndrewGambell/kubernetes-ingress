@@ -122,4 +122,7 @@ func (lbc *LoadBalancerController) syncNamespace(task task) {
 			return
 		}
 	}
+	if err := lbc.refreshDiscoveredEndpoints(key); err != nil {
+		lbc.syncQueue.Requeue(task, err)
+	}
 }

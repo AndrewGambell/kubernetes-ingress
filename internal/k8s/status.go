@@ -27,6 +27,7 @@ import (
 // API. For external information, it primarily reports the IP or host of the LoadBalancer Service exposing the
 // Ingress Controller, or an external IP specified in the ConfigMap.
 type statusUpdater struct {
+	listenerDiscovery        *listenerServiceDiscovery
 	client                   kubernetes.Interface
 	namespace                string
 	externalServiceName      string
@@ -296,6 +297,11 @@ func (su *statusUpdater) SaveStatusFromExternalStatus(externalStatusAddress stri
 			su.externalEndpoints = su.generateExternalEndpointsFromStatus(su.status)
 			return
 		}
+
+		// nothing to fall back on, so clear the address instead of reporting an empty one
+		su.saveStatus(nil)
+		su.externalEndpoints = nil
+		return
 	}
 	ips := []string{}
 	ips = append(ips, su.externalStatusAddress)
@@ -403,16 +409,21 @@ func (su *statusUpdater) retryUpdateVirtualServerRouteReferencedBy(namespace str
 		return err
 	}
 
-	if vsr.Status.ReferencedBy == referencedBy {
+	endpoints := vsr.Status.ExternalEndpoints
+	if su.listenerDiscovery != nil {
+		endpoints = su.virtualServerRouteEndpoints(vsr)
+	}
+	if vsr.Status.ReferencedBy == referencedBy && reflect.DeepEqual(vsr.Status.ExternalEndpoints, endpoints) {
 		return nil
 	}
 
 	vsr.Status.ReferencedBy = referencedBy
+	vsr.Status.ExternalEndpoints = endpoints
 	_, err = su.confClient.K8sV1().VirtualServerRoutes(namespace).UpdateStatus(context.TODO(), vsr, metav1.UpdateOptions{})
 	return err
 }
 
-func (su *statusUpdater) hasVsStatusChanged(vs *conf_v1.VirtualServer, state string, reason string, message string) bool {
+func (su *statusUpdater) hasVsStatusChanged(vs *conf_v1.VirtualServer, state string, reason string, message string, endpoints []conf_v1.ExternalEndpoint) bool {
 	if vs.Status.State != state {
 		return true
 	}
@@ -425,7 +436,7 @@ func (su *statusUpdater) hasVsStatusChanged(vs *conf_v1.VirtualServer, state str
 		return true
 	}
 
-	if !reflect.DeepEqual(vs.Status.ExternalEndpoints, su.externalEndpoints) {
+	if !reflect.DeepEqual(vs.Status.ExternalEndpoints, endpoints) {
 		return true
 	}
 
@@ -511,14 +522,15 @@ func (su *statusUpdater) UpdateVirtualServerStatus(vs *conf_v1.VirtualServer, st
 
 	vsCopy := vsLatest.(*conf_v1.VirtualServer).DeepCopy()
 
-	if !su.hasVsStatusChanged(vsCopy, state, reason, message) {
+	endpoints := su.virtualServerEndpoints(vsCopy)
+	if !su.hasVsStatusChanged(vsCopy, state, reason, message, endpoints) {
 		return nil
 	}
 
 	vsCopy.Status.State = state
 	vsCopy.Status.Reason = reason
 	vsCopy.Status.Message = message
-	vsCopy.Status.ExternalEndpoints = su.externalEndpoints
+	vsCopy.Status.ExternalEndpoints = endpoints
 
 	_, err = su.confClient.K8sV1().VirtualServers(vsCopy.Namespace).UpdateStatus(context.TODO(), vsCopy, metav1.UpdateOptions{})
 	if err != nil {
@@ -529,7 +541,7 @@ func (su *statusUpdater) UpdateVirtualServerStatus(vs *conf_v1.VirtualServer, st
 }
 
 // hasVsrStatusChanged ignores referencedBy when nil; a pointer to an empty string detects clearing it.
-func (su *statusUpdater) hasVsrStatusChanged(vsr *conf_v1.VirtualServerRoute, state string, reason string, message string, referencedBy *string) bool {
+func (su *statusUpdater) hasVsrStatusChanged(vsr *conf_v1.VirtualServerRoute, state string, reason string, message string, referencedBy *string, endpoints []conf_v1.ExternalEndpoint) bool {
 	if vsr.Status.State != state {
 		return true
 	}
@@ -546,7 +558,7 @@ func (su *statusUpdater) hasVsrStatusChanged(vsr *conf_v1.VirtualServerRoute, st
 		return true
 	}
 
-	if !reflect.DeepEqual(vsr.Status.ExternalEndpoints, su.externalEndpoints) {
+	if !reflect.DeepEqual(vsr.Status.ExternalEndpoints, endpoints) {
 		return true
 	}
 
@@ -595,7 +607,8 @@ func (su *statusUpdater) UpdateVirtualServerRouteStatusWithReferencedBy(vsr *con
 
 	vsrCopy := vsrLatest.(*conf_v1.VirtualServerRoute).DeepCopy()
 
-	if !su.hasVsrStatusChanged(vsrCopy, state, reason, message, &referencedByString) {
+	endpoints := su.virtualServerRouteEndpoints(vsrCopy)
+	if !su.hasVsrStatusChanged(vsrCopy, state, reason, message, &referencedByString, endpoints) {
 		return nil
 	}
 
@@ -603,7 +616,7 @@ func (su *statusUpdater) UpdateVirtualServerRouteStatusWithReferencedBy(vsr *con
 	vsrCopy.Status.Reason = reason
 	vsrCopy.Status.Message = message
 	vsrCopy.Status.ReferencedBy = referencedByString
-	vsrCopy.Status.ExternalEndpoints = su.externalEndpoints
+	vsrCopy.Status.ExternalEndpoints = endpoints
 
 	_, err = su.confClient.K8sV1().VirtualServerRoutes(vsrCopy.Namespace).UpdateStatus(context.TODO(), vsrCopy, metav1.UpdateOptions{})
 	if err != nil {
@@ -640,7 +653,10 @@ func (su *statusUpdater) UpdateVirtualServerRouteReferencedBy(vsr *conf_v1.Virtu
 
 	vsrCopy := vsrLatest.(*conf_v1.VirtualServerRoute).DeepCopy()
 
-	if vsrCopy.Status.ReferencedBy == referencedByString {
+	if su.listenerDiscovery != nil {
+		vsrCopy.Status.ExternalEndpoints = su.virtualServerRouteEndpoints(vsrCopy)
+	}
+	if vsrCopy.Status.ReferencedBy == referencedByString && reflect.DeepEqual(vsrCopy.Status.ExternalEndpoints, vsrLatest.(*conf_v1.VirtualServerRoute).Status.ExternalEndpoints) {
 		return nil
 	}
 
@@ -682,14 +698,15 @@ func (su *statusUpdater) UpdateVirtualServerRouteStatus(vsr *conf_v1.VirtualServ
 
 	vsrCopy := vsrLatest.(*conf_v1.VirtualServerRoute).DeepCopy()
 
-	if !su.hasVsrStatusChanged(vsrCopy, state, reason, message, nil) {
+	endpoints := su.virtualServerRouteEndpoints(vsrCopy)
+	if !su.hasVsrStatusChanged(vsrCopy, state, reason, message, nil, endpoints) {
 		return nil
 	}
 
 	vsrCopy.Status.State = state
 	vsrCopy.Status.Reason = reason
 	vsrCopy.Status.Message = message
-	vsrCopy.Status.ExternalEndpoints = su.externalEndpoints
+	vsrCopy.Status.ExternalEndpoints = endpoints
 
 	_, err = su.confClient.K8sV1().VirtualServerRoutes(vsrCopy.Namespace).UpdateStatus(context.TODO(), vsrCopy, metav1.UpdateOptions{})
 	if err != nil {
@@ -700,6 +717,11 @@ func (su *statusUpdater) UpdateVirtualServerRouteStatus(vsr *conf_v1.VirtualServ
 }
 
 func (su *statusUpdater) updateVirtualServerExternalEndpoints(vs *conf_v1.VirtualServer) error {
+	return su.setVirtualServerExternalEndpoints(vs, su.virtualServerEndpoints)
+}
+
+// setVirtualServerExternalEndpoints writes the endpoints returned by endpointsFor when they differ from the stored status.
+func (su *statusUpdater) setVirtualServerExternalEndpoints(vs *conf_v1.VirtualServer, endpointsFor func(*conf_v1.VirtualServer) []conf_v1.ExternalEndpoint) error {
 	// Get a pristine VirtualServer from the Store
 	var vsLatest interface{}
 	var exists bool
@@ -723,7 +745,10 @@ func (su *statusUpdater) updateVirtualServerExternalEndpoints(vs *conf_v1.Virtua
 	}
 
 	vsCopy := vsLatest.(*conf_v1.VirtualServer).DeepCopy()
-	vsCopy.Status.ExternalEndpoints = su.externalEndpoints
+	vsCopy.Status.ExternalEndpoints = endpointsFor(vsCopy)
+	if reflect.DeepEqual(vsCopy.Status.ExternalEndpoints, vsLatest.(*conf_v1.VirtualServer).Status.ExternalEndpoints) {
+		return nil
+	}
 
 	_, err = su.confClient.K8sV1().VirtualServers(vsCopy.Namespace).UpdateStatus(context.TODO(), vsCopy, metav1.UpdateOptions{})
 	if err != nil {
@@ -734,6 +759,11 @@ func (su *statusUpdater) updateVirtualServerExternalEndpoints(vs *conf_v1.Virtua
 }
 
 func (su *statusUpdater) updateVirtualServerRouteExternalEndpoints(vsr *conf_v1.VirtualServerRoute) error {
+	return su.setVirtualServerRouteExternalEndpoints(vsr, su.virtualServerRouteEndpoints)
+}
+
+// setVirtualServerRouteExternalEndpoints writes the endpoints returned by endpointsFor when they differ from the stored status.
+func (su *statusUpdater) setVirtualServerRouteExternalEndpoints(vsr *conf_v1.VirtualServerRoute, endpointsFor func(*conf_v1.VirtualServerRoute) []conf_v1.ExternalEndpoint) error {
 	// Get an up-to-date VirtualServerRoute from the Store
 	var vsrLatest interface{}
 	var exists bool
@@ -757,7 +787,10 @@ func (su *statusUpdater) updateVirtualServerRouteExternalEndpoints(vsr *conf_v1.
 	}
 
 	vsrCopy := vsrLatest.(*conf_v1.VirtualServerRoute).DeepCopy()
-	vsrCopy.Status.ExternalEndpoints = su.externalEndpoints
+	vsrCopy.Status.ExternalEndpoints = endpointsFor(vsrCopy)
+	if reflect.DeepEqual(vsrCopy.Status.ExternalEndpoints, vsrLatest.(*conf_v1.VirtualServerRoute).Status.ExternalEndpoints) {
+		return nil
+	}
 
 	_, err = su.confClient.K8sV1().VirtualServerRoutes(vsrCopy.Namespace).UpdateStatus(context.TODO(), vsrCopy, metav1.UpdateOptions{})
 	if err != nil {

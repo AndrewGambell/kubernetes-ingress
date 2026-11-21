@@ -49,11 +49,12 @@ func createServiceHandlers(lbc *LoadBalancerController) cache.ResourceEventHandl
 		UpdateFunc: func(old, cur interface{}) {
 			if !reflect.DeepEqual(old, cur) {
 				curSvc := cur.(*v1.Service)
-				if lbc.IsExternalServiceForStatus(curSvc) {
+				oldSvc := old.(*v1.Service)
+				discovery := lbc.statusUpdater.listenerDiscovery
+				if lbc.IsExternalServiceForStatus(curSvc) || discovery.selectsController(oldSvc) || discovery.selectsController(curSvc) {
 					lbc.AddSyncQueue(curSvc)
 					return
 				}
-				oldSvc := old.(*v1.Service)
 				if hasServicedChanged(oldSvc, curSvc) {
 					nl.Infof(lbc.Logger.With(logNamespaceKey, oldSvc.Namespace, logKindKey, serviceKind, logNameKey, oldSvc.Name), "Service %v changed, syncing", curSvc.Name)
 					lbc.AddSyncQueue(curSvc)
@@ -219,6 +220,14 @@ func (lbc *LoadBalancerController) syncService(task task) {
 	if err != nil {
 		lbc.syncQueue.Requeue(task, err)
 		return
+	}
+
+	var svc *v1.Service
+	if exists {
+		svc = obj.(*v1.Service)
+	}
+	if err := lbc.refreshDiscoveredEndpointsForService(ns, n, svc); err != nil {
+		lbc.syncQueue.Requeue(task, err)
 	}
 
 	// First case: the service is the external service for the Ingress Controller

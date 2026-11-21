@@ -320,6 +320,8 @@ type NewLoadBalancerControllerInput struct {
 	IsNginxPlus                  bool
 	IngressClass                 string
 	ExternalServiceName          string
+	DiscoverListenerServices     bool
+	ListenerServiceNames         []string
 	IngressLink                  string
 	ControllerNamespace          string
 	Pod                          *api_v1.Pod
@@ -558,6 +560,13 @@ func NewLoadBalancerController(input NewLoadBalancerControllerInput) *LoadBalanc
 		input.IsDirectiveAutoadjustEnabled,
 		input.AllowEmptyIngressHost,
 	)
+
+	if input.DiscoverListenerServices {
+		lbc.statusUpdater.listenerDiscovery = newListenerServiceDiscovery(lbc.Logger, input.Pod, lbc.configuration, input.WildcardTLSSecret != "", input.ListenerServiceNames)
+		if !isDynamicNs && lbc.getNamespacedInformer(input.ControllerNamespace) == nil {
+			nl.Warnf(lbc.Logger, "-discover-listener-services is set, but the controller namespace %q is not in -watch-namespace; no listener Services will be discovered", input.ControllerNamespace)
+		}
+	}
 
 	lbc.appProtectConfiguration = appprotect.NewConfiguration(lbc.Logger)
 	lbc.dosConfiguration = appprotectdos.NewConfiguration(input.AppProtectDosEnabled)

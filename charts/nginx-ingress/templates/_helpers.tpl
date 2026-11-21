@@ -388,7 +388,18 @@ Build the args for the service binary.
 {{- end }}
 {{- if .Values.controller.reportIngressStatus.enable }}
 - -report-ingress-status
-{{- if .Values.controller.reportIngressStatus.ingressLink }}
+{{- if .Values.controller.reportIngressStatus.discoverListenerServices }}
+{{- if or .Values.controller.reportIngressStatus.ingressLink .Values.controller.reportIngressStatus.externalService }}
+{{- fail "controller.reportIngressStatus.discoverListenerServices cannot be combined with controller.reportIngressStatus.externalService or controller.reportIngressStatus.ingressLink" }}
+{{- end }}
+{{- if not .Values.controller.enableCustomResources }}
+{{- fail "controller.reportIngressStatus.discoverListenerServices requires controller.enableCustomResources=true" }}
+{{- end }}
+- -discover-listener-services
+{{- with .Values.controller.reportIngressStatus.discoverListenerServiceNames }}
+- -discover-listener-service-names={{ join "," . }}
+{{- end }}
+{{- else if .Values.controller.reportIngressStatus.ingressLink }}
 - -ingresslink={{ .Values.controller.reportIngressStatus.ingressLink }}
 {{- else if .Values.controller.reportIngressStatus.externalService }}
 - -external-service={{ .Values.controller.reportIngressStatus.externalService }}

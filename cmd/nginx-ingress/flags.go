@@ -150,6 +150,16 @@ NIC prints a startup warning when set. Requires -plm-storage-url.`)
 		`Specifies the name of the service with the type LoadBalancer through which the Ingress Controller pods are exposed externally.
 	The external address of the service is used when reporting the status of Ingress, VirtualServer and VirtualServerRoute resources. For Ingress resources only: Requires -report-ingress-status.`)
 
+	discoverListenerServices = flag.Bool("discover-listener-services", false,
+		`Reports VirtualServer and VirtualServerRoute endpoints from LoadBalancer Services that select the controller pods and expose the listener ports.
+	Only addresses in each Service's status.loadBalancer.ingress are reported. Requires -enable-custom-resources.`)
+
+	discoverListenerServiceNames = flag.String("discover-listener-service-names", "",
+		`A comma-separated list of Service names in the controller namespace that -discover-listener-services may report.
+	When empty, every LoadBalancer Service that selects the controller pods is eligible. Requires -discover-listener-services.`)
+
+	listenerServiceNames []string
+
 	ingressLink = flag.String("ingresslink", "",
 		`Specifies the name of the IngressLink resource, which exposes the Ingress Controller pods via a BIG-IP system.
 	The IP of the BIG-IP system is used when reporting the status of Ingress, VirtualServer and VirtualServerRoute resources. For Ingress resources only: Requires -report-ingress-status.`)
@@ -527,6 +537,26 @@ func mustValidateFlags(ctx context.Context) {
 		nl.Fatal(l, "ingresslink and external-service cannot both be set")
 	}
 
+	if *discoverListenerServices {
+		if !*enableCustomResources {
+			nl.Fatal(l, "discover-listener-services requires -enable-custom-resources")
+		}
+		if *externalService != "" || *ingressLink != "" {
+			nl.Fatal(l, "discover-listener-services cannot be combined with external-service or ingresslink")
+		}
+	}
+
+	if *discoverListenerServiceNames != "" {
+		if !*discoverListenerServices {
+			nl.Fatal(l, "discover-listener-service-names requires -discover-listener-services")
+		}
+		names, err := parseServiceNames(*discoverListenerServiceNames)
+		if err != nil {
+			nl.Fatalf(l, "Invalid value for discover-listener-service-names: %v", err)
+		}
+		listenerServiceNames = names
+	}
+
 	if *nginxPlus && *mgmtConfigMap == "" {
 		nl.Fatal(l, "NGINX Plus requires a mgmt ConfigMap to be set")
 	}
@@ -574,6 +604,19 @@ func validateLogLevel(logLevel string) error {
 		return nil
 	}
 	return fmt.Errorf("invalid log level: %v", logLevel)
+}
+
+// parseServiceNames parses a comma-separated list of Service names.
+func parseServiceNames(s string) ([]string, error) {
+	var names []string
+	for _, name := range strings.Split(s, ",") {
+		name = strings.TrimSpace(name)
+		if errs := validation.IsDNS1035Label(name); len(errs) > 0 {
+			return nil, fmt.Errorf("invalid Service name %q: %v", name, strings.Join(errs, ", "))
+		}
+		names = append(names, name)
+	}
+	return names, nil
 }
 
 // parseLatencyBuckets parses a comma-separated list of latency histogram buckets
